@@ -1,0 +1,28 @@
+{
+    "files.associations": {
+        "mqtt.h": "c",
+        "atomic": "c",
+        "memory": "c",
+        "mutex": "c",
+        "__config": "c",
+        "ios": "c",
+        "iosfwd": "c",
+        "locale": "c",
+        "optional": "c",
+        "string": "c",
+        "__hash_table": "c",
+        "__locale": "c",
+        "__split_buffer": "c",
+        "array": "c",
+        "bitset": "c",
+        "iterator": "c",
+        "print": "c",
+        "sstream": "c",
+        "string_view": "c",
+        "vector": "c",
+        "__assert": "c",
+        "__assertion_handler": "c",
+        "stdexcept": "c",
+        "system_error": "c"
+    }
+}

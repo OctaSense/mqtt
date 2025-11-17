@@ -5,10 +5,11 @@ A lightweight MQTT client library written in C, focusing on protocol implementat
 ## Features
 
 - ✅ MQTT 3.1.1 protocol support
-- ✅ QoS 0, 1, 2 support
+- ✅ QoS 0 support (at most once delivery)
+- ❌ QoS 1 and 2 not supported
 - ✅ Clean session support
 - ✅ Keep-alive and heartbeat
-- ✅ Packet retransmission
+- ❌ Packet retransmission (not implemented for QoS 0)
 - ✅ Connection status callbacks
 - ✅ Message reception callbacks
 - ✅ Publish/subscribe/unsubscribe
@@ -32,8 +33,8 @@ A lightweight MQTT client library written in C, focusing on protocol implementat
 
 3. **Timer Management**
    - Keep-alive timer for heartbeat
-   - Packet timeout handling
-   - Retransmission logic
+   - Packet timeout handling (for connection management)
+   - No retransmission logic (QoS 0 only)
 
 4. **Callback Interface**
    - Connection status callbacks
@@ -100,8 +101,8 @@ mqtt/
 
 Once connected, you can use these commands:
 
-- `subscribe <topic>` - Subscribe to a topic
-- `publish <topic> <message>` - Publish a message
+- `subscribe <topic>` - Subscribe to a topic (QoS 0 only)
+- `publish <topic> <message>` - Publish a message (QoS 0 only)
 - `quit` or `exit` - Exit the program
 - `help` - Show available commands
 
@@ -139,7 +140,7 @@ mqtt_config_t config = {
     .keep_alive = 60,
     .clean_session = true,
     .packet_timeout = 5000,
-    .max_retry_count = 3
+    .max_retry_count = 3  // Note: Retry count is not used for QoS 0
 };
 
 // Handlers
@@ -166,19 +167,19 @@ while (running) {
     // Drive timer operations
     mqtt_timer(mqtt, elapsed_ms);
     
-    // Publish messages
+    // Publish messages (QoS 0 only)
     mqtt_message_t message = {
         .topic = "test/topic",
         .payload = (uint8_t*)"Hello",
         .payload_len = 5,
-        .qos = MQTT_QOS_0,
+        .qos = MQTT_QOS_0,  // Only QoS 0 is supported
         .retain = false
     };
     mqtt_publish(mqtt, &message);
     
-    // Subscribe to topics
+    // Subscribe to topics (QoS 0 only)
     const char *topics[] = {"test/topic"};
-    mqtt_qos_t qos[] = {MQTT_QOS_0};
+    mqtt_qos_t qos[] = {MQTT_QOS_0};  // Only QoS 0 is supported
     mqtt_subscribe(mqtt, topics, qos, 1);
 }
 
@@ -227,7 +228,17 @@ Test the command line client with public MQTT brokers:
 > publish test/topic "Hello World"
 ```
 
-## Architecture Details
+## Implementation Details
+
+### QoS 0 Only Implementation
+
+This library implements **only QoS 0 (at most once delivery)**:
+
+- **Publish**: Messages are sent once without acknowledgment
+- **Subscribe**: Subscriptions use QoS 0 only
+- **No retransmission**: No packet retry logic implemented
+- **No packet IDs**: QoS 0 doesn't require packet identifiers
+- **Simple flow**: No PUBACK/PUBREC/PUBREL/PUBCOMP handling
 
 ### Thread Safety
 
@@ -258,8 +269,9 @@ This allows easy integration with different transport mechanisms (TCP, TLS, WebS
 
 ## Limitations
 
-- Currently implements basic packet structure
-- Full packet parsing and state machine implemented
+- **Only QoS 0 is supported** - QoS 1 and 2 are not implemented
+- **No packet retransmission** - Messages are sent once without acknowledgment
+- **No packet ID tracking** - QoS 0 doesn't require packet identifiers
 - No TLS support (transport layer responsibility)
 - Thread-safe with immediate packet processing
 

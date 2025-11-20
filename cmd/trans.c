@@ -223,8 +223,16 @@ int trans_send(trans_context_t *ctx, const uint8_t *data, size_t len)
         }
         return 0; // Would block
     }
-    
-    printf("Sent %zd bytes\n", sent);
+
+    printf("Sent %zd bytes", sent);
+    if (sent > 0 && sent <= 20) {
+        printf(" [");
+        for (ssize_t i = 0; i < sent; i++) {
+            printf("%02x ", data[i]);
+        }
+        printf("]");
+    }
+    printf("\n");
     return (int)sent;
 }
 

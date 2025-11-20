@@ -326,18 +326,19 @@ int mqtt_subscribe(mqtt_t *mqtt, const char **topics, const mqtt_qos_t *qos, siz
         }
     }
 
-    // Create and send SUBSCRIBE packet (QoS 0 only)
+    // Create and send SUBSCRIBE packet (packet ID required even for QoS 0 subscriptions)
     uint8_t packet_buf[1024];
-    size_t packet_len = create_subscribe_packet(topics, qos, count, 0, packet_buf, sizeof(packet_buf));
-    
+    uint16_t packet_id = mqtt_get_packet_id(mqtt);
+    size_t packet_len = create_subscribe_packet(topics, qos, count, packet_id, packet_buf, sizeof(packet_buf));
+
     if (packet_len == 0) {
         return -1;
     }
-    
+
     if (mqtt->handler.send(packet_buf, packet_len, mqtt->user_data) != (int)packet_len) {
         return -1;
     }
-    
+
     return 0;
 }
 

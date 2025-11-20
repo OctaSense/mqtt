@@ -140,24 +140,28 @@ size_t create_connect_packet(const mqtt_config_t *config, uint8_t *buf, size_t b
     }
     
     size_t pos = 0;
-    
+
     // Fixed header
     buf[pos++] = (MQTT_PKT_CONNECT << 4); // CONNECT packet type
-    
-    // Variable header starts after remaining length
-    size_t var_header_pos = pos + 1; // +1 for remaining length byte
-    
+
+    // Reserve maximum space for remaining length (4 bytes)
+    size_t remaining_length_pos = pos;
+    pos += 4;  // Reserve 4 bytes for remaining length
+
+    // Write variable header and payload
+    size_t var_header_start = pos;
+
     // Protocol name "MQTT"
-    buf[var_header_pos++] = 0x00;
-    buf[var_header_pos++] = 0x04;
-    buf[var_header_pos++] = 'M';
-    buf[var_header_pos++] = 'Q';
-    buf[var_header_pos++] = 'T';
-    buf[var_header_pos++] = 'T';
-    
+    buf[pos++] = 0x00;
+    buf[pos++] = 0x04;
+    buf[pos++] = 'M';
+    buf[pos++] = 'Q';
+    buf[pos++] = 'T';
+    buf[pos++] = 'T';
+
     // Protocol level (4 = MQTT 3.1.1)
-    buf[var_header_pos++] = 0x04;
-    
+    buf[pos++] = 0x04;
+
     // Connect flags
     uint8_t connect_flags = 0;
     if (config->clean_session) {
@@ -169,36 +173,41 @@ size_t create_connect_packet(const mqtt_config_t *config, uint8_t *buf, size_t b
     if (config->password) {
         connect_flags |= 0x40;
     }
-    buf[var_header_pos++] = connect_flags;
-    
+    buf[pos++] = connect_flags;
+
     // Keep alive (2 bytes, big-endian)
-    buf[var_header_pos++] = (config->keep_alive >> 8) & 0xFF;
-    buf[var_header_pos++] = config->keep_alive & 0xFF;
-    
+    buf[pos++] = (config->keep_alive >> 8) & 0xFF;
+    buf[pos++] = config->keep_alive & 0xFF;
+
     // Payload: Client ID
-    var_header_pos += write_string(buf + var_header_pos, config->client_id);
-    
+    pos += write_string(buf + pos, config->client_id);
+
     // Optional: Username
     if (config->username) {
-        var_header_pos += write_string(buf + var_header_pos, config->username);
+        pos += write_string(buf + pos, config->username);
     }
-    
+
     // Optional: Password
     if (config->password) {
-        var_header_pos += write_string(buf + var_header_pos, config->password);
+        pos += write_string(buf + pos, config->password);
     }
-    
-    // Calculate remaining length
-    uint32_t remaining_length = var_header_pos - (pos + 1);
-    
-    // Write remaining length
-    size_t len_bytes = write_variable_length(buf + pos, remaining_length);
-    pos += len_bytes;
-    
-    // Copy variable header and payload
-    memmove(buf + pos, buf + pos + 1, remaining_length);
-    
-    return pos + remaining_length;
+
+    // Calculate actual remaining length
+    uint32_t remaining_length = pos - var_header_start;
+
+    // Write remaining length and get actual bytes used
+    uint8_t temp_buf[4];
+    size_t len_bytes = write_variable_length(temp_buf, remaining_length);
+
+    // Move variable header to correct position (closing the gap)
+    if (len_bytes < 4) {
+        memmove(buf + remaining_length_pos + len_bytes, buf + var_header_start, remaining_length);
+    }
+
+    // Copy the remaining length bytes
+    memcpy(buf + remaining_length_pos, temp_buf, len_bytes);
+
+    return 1 + len_bytes + remaining_length;
 }
 
 /**
@@ -220,7 +229,7 @@ size_t create_publish_packet(const mqtt_message_t *message, uint8_t *buf, size_t
     }
     
     size_t pos = 0;
-    
+
     // Fixed header (QoS 0 only)
     uint8_t fixed_header = (MQTT_PKT_PUBLISH << 4);
     if (message->retain) {
@@ -228,30 +237,39 @@ size_t create_publish_packet(const mqtt_message_t *message, uint8_t *buf, size_t
     }
     // QoS is always 0, so no need to set QoS bits
     buf[pos++] = fixed_header;
-    
-    // Variable header starts after remaining length
-    size_t var_header_pos = pos + 1; // +1 for remaining length byte
-    
+
+    // Reserve maximum space for remaining length (4 bytes)
+    size_t remaining_length_pos = pos;
+    pos += 4;  // Reserve 4 bytes for remaining length
+
+    // Write variable header and payload
+    size_t var_header_start = pos;
+
     // Topic name
-    var_header_pos += write_string(buf + var_header_pos, message->topic);
-    
+    pos += write_string(buf + pos, message->topic);
+
     // Payload
     if (message->payload && message->payload_len > 0) {
-        memcpy(buf + var_header_pos, message->payload, message->payload_len);
-        var_header_pos += message->payload_len;
+        memcpy(buf + pos, message->payload, message->payload_len);
+        pos += message->payload_len;
     }
-    
-    // Calculate remaining length
-    uint32_t remaining_length = var_header_pos - (pos + 1);
-    
-    // Write remaining length
-    size_t len_bytes = write_variable_length(buf + pos, remaining_length);
-    pos += len_bytes;
-    
-    // Copy variable header and payload
-    memmove(buf + pos, buf + pos + 1, remaining_length);
-    
-    return pos + remaining_length;
+
+    // Calculate actual remaining length
+    uint32_t remaining_length = pos - var_header_start;
+
+    // Write remaining length and get actual bytes used
+    uint8_t temp_buf[4];
+    size_t len_bytes = write_variable_length(temp_buf, remaining_length);
+
+    // Move variable header to correct position (closing the gap)
+    if (len_bytes < 4) {
+        memmove(buf + remaining_length_pos + len_bytes, buf + var_header_start, remaining_length);
+    }
+
+    // Copy the remaining length bytes
+    memcpy(buf + remaining_length_pos, temp_buf, len_bytes);
+
+    return 1 + len_bytes + remaining_length;
 }
 
 /**
@@ -311,15 +329,17 @@ size_t create_subscribe_packet(const char **topics, const mqtt_qos_t *qos, size_
     // (packet_id parameter kept for API compatibility but ignored)
     
     size_t pos = 0;
-    
-    // Fixed header (QoS 0 only)
-    buf[pos++] = (MQTT_PKT_SUBSCRIBE << 4); // SUBSCRIBE with QoS 0
-    
+
+    // Fixed header (SUBSCRIBE must use flags 0x02)
+    buf[pos++] = (MQTT_PKT_SUBSCRIBE << 4) | 0x02; // SUBSCRIBE requires QoS 1 in fixed header
+
     // Variable header starts after remaining length
     size_t var_header_pos = pos + 1; // +1 for remaining length byte
-    
-    // No packet ID for QoS 0
-    
+
+    // Packet ID (SUBSCRIBE always requires packet ID, even for QoS 0 subscriptions)
+    buf[var_header_pos++] = (packet_id >> 8) & 0xFF;
+    buf[var_header_pos++] = packet_id & 0xFF;
+
     // Payload: topic-QoS pairs
     for (size_t i = 0; i < count; i++) {
         if (!topics[i]) {
@@ -339,18 +359,19 @@ size_t create_subscribe_packet(const char **topics, const mqtt_qos_t *qos, size_
         }
         buf[var_header_pos++] = qos[i] & 0x03;
     }
-    
+
     // Calculate remaining length
     uint32_t remaining_length = var_header_pos - (pos + 1);
-    
+
     // Write remaining length
     size_t len_bytes = write_variable_length(buf + pos, remaining_length);
-    pos += len_bytes;
-    
-    // Copy variable header and payload
-    memmove(buf + pos, buf + pos + 1, remaining_length);
-    
-    return pos + remaining_length;
+
+    // If remaining length takes more than 1 byte, need to move variable header
+    if (len_bytes > 1) {
+        memmove(buf + pos + len_bytes, buf + pos + 1, remaining_length);
+    }
+
+    return 1 + len_bytes + remaining_length;
 }
 
 /**
@@ -395,16 +416,17 @@ size_t create_unsubscribe_packet(const char **topics, size_t count, uint16_t pac
         }
         var_header_pos += topic_bytes;
     }
-    
+
     // Calculate remaining length
     uint32_t remaining_length = var_header_pos - (pos + 1);
-    
+
     // Write remaining length
     size_t len_bytes = write_variable_length(buf + pos, remaining_length);
-    pos += len_bytes;
-    
-    // Copy variable header and payload
-    memmove(buf + pos, buf + pos + 1, remaining_length);
-    
-    return pos + remaining_length;
+
+    // If remaining length takes more than 1 byte, need to move variable header
+    if (len_bytes > 1) {
+        memmove(buf + pos + len_bytes, buf + pos + 1, remaining_length);
+    }
+
+    return 1 + len_bytes + remaining_length;
 }

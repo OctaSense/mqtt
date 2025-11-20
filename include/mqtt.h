@@ -304,45 +304,6 @@ void mqtt_mem_reset_stats(void);
 
 #endif
 
-/**
- * @brief TCP transport layer functions
- */
-
-/**
- * @brief Transport layer send callback for TCP sockets
- * @param socket_fd Socket file descriptor
- * @param data Data to send
- * @param len Length of data
- * @return Number of bytes sent, or -1 on error
- */
-int mqtt_tcp_send(int socket_fd, const uint8_t *data, size_t len);
-
-/**
- * @brief Connect to MQTT broker via TCP
- * @param host Broker hostname or IP address
- * @param port Broker port
- * @return Socket file descriptor on success, -1 on failure
- */
-int mqtt_tcp_connect(const char *host, uint16_t port);
-
-/**
- * @brief Read data from TCP socket and process it
- * @param socket_fd Socket file descriptor
- * @param buffer Buffer to store received data
- * @param buffer_size Size of buffer
- * @param process_callback Callback function to process received data
- * @param user_data User data passed to callback
- * @return Number of bytes read, 0 on connection closed, -1 on error
- */
-int mqtt_tcp_read_and_process(int socket_fd, uint8_t *buffer, size_t buffer_size,
-                             int (*process_callback)(const uint8_t *data, size_t len, void *user_data),
-                             void *user_data);
-
-/**
- * @brief Close TCP connection
- * @param socket_fd Socket file descriptor to close
- */
-void mqtt_tcp_close(int socket_fd);
 
 /**
  * @brief Packet creation functions (internal use)

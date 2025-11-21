@@ -4,11 +4,14 @@
  */
 
 #include "mqtt.h"
+#include "mqtt_intl.h"
 #include <string.h>
 #include <assert.h>
 #include <stdio.h>
 
-// Spinlock macros for thread-safe operations
+/**
+ * @brief Spinlock macros for thread-safe operations
+ */
 #define LOCK(mqtt) do { \
     while (__sync_lock_test_and_set(&(mqtt)->lock, 1)) { \
         /* Spin until lock acquired */ \
@@ -19,655 +22,434 @@
     __sync_lock_release(&(mqtt)->lock); \
 } while(0)
 
-
-
-/**
- * @brief Default reassembly buffer size
- */
-#define MQTT_REASSEMBLY_BUF_SIZE 4096
-
-/**
- * @brief Maximum MQTT packet size (128KB as per MQTT spec)
- */
-#define MQTT_MAX_PACKET_SIZE (128 * 1024)
-
-/**
- * @brief MQTT instance internal structure
- */
 struct mqtt_s {
-    mqtt_config_t config;         /**< Client configuration */
-    mqtt_handler_t handler;       /**< Callback handlers */
-    void *user_data;              /**< User context */
-    volatile mqtt_state_t state;           /**< Connection state */
-    uint16_t next_packet_id;      /**< Next packet identifier */
-    uint32_t keep_alive_timer;    /**< Keep-alive timer */
-    uint32_t last_activity;       /**< Last activity timestamp */
-    bool waiting_pingresp;        /**< Waiting for PINGRESP */
-    uint8_t missed_pingresp_count; /**< Count of consecutive missed PINGRESP responses */
-    
-    // Packet reassembly buffers for handling TCP stream fragmentation
-    uint8_t *reassembly_buf;      /**< Buffer for reassembling incomplete packets */
-    size_t reassembly_len;        /**< Current length of data in reassembly buffer */
-    size_t reassembly_capacity;   /**< Capacity of reassembly buffer */
-    
-    // Thread safety: spinlock for non-blocking synchronization
-    volatile int lock;            /**< Spinlock for thread-safe operations */
+    mqtt_config_t config;
+    mqtt_handler_t handler;
+    void *user_data;
+    volatile mqtt_state_t state;
+    uint16_t next_packet_id;
+    uint32_t keepalive_timer;
+    uint32_t last_activity;
+    bool waiting_pingresp;
+    uint8_t missed_pings;
+
+    uint8_t *rbuf;
+    size_t rlen;
+    size_t rcap;
+
+    volatile int lock;
 };
 
 
-/**
- * @brief Get the expected length of an MQTT packet
- * @param data Packet data
- * @param len Current data length
- * @return Expected total packet length, or 0 if not enough data to determine
- */
-static size_t get_expected_packet_length(const uint8_t *data, size_t len)
+/* Internal helpers */
+
+static size_t get_packet_len(const uint8_t *data, size_t len)
 {
-    if (len < 2) {
-        return 0; // Not enough data for fixed header
-    }
-    
-    // Read variable length field
-    uint32_t remaining_length = 0;
-    size_t multiplier = 1;
-    size_t pos = 1; // Start after packet type byte
-    
+    if (len < MQTT_MIN_HEADER_SIZE) return 0;
+
+    uint32_t rem_len = 0;
+    size_t mult = MQTT_VARLEN_INITIAL_MULT;
+    size_t pos = MQTT_VARLEN_INITIAL_POS;
+
     do {
-        if (pos >= len) {
-            return 0; // Not enough data for variable length field
-        }
-        
-        uint8_t encoded_byte = data[pos];
-        remaining_length += (encoded_byte & 0x7F) * multiplier;
-        multiplier *= 128;
+        if (pos >= len) return 0;
+
+        uint8_t byte = data[pos];
+        rem_len += (byte & MQTT_VARLEN_MASK) * mult;
+        mult *= MQTT_VARLEN_MULTIPLIER_BASE;
         pos++;
-        
-        if (multiplier > 128 * 128 * 128) {
-            return 0; // Invalid packet - variable length too large
+
+        if (mult > MQTT_VARLEN_MULTIPLIER_BASE * MQTT_VARLEN_MULTIPLIER_BASE * MQTT_VARLEN_MULTIPLIER_BASE) {
+            return 0;
         }
-    } while ((data[pos - 1] & 0x80) != 0);
-    
-    // Total packet length = fixed header (1 byte) + variable length bytes + remaining length
-    size_t total_length = pos + remaining_length;
-    return total_length;
+    } while ((data[pos - 1] & MQTT_VARLEN_CONTINUE) != 0);
+
+    return pos + rem_len;
 }
 
-/**
- * @brief Ensure reassembly buffer has enough capacity
- * @param mqtt MQTT instance
- * @param needed_capacity Required capacity
- * @return 0 on success, -1 on failure
- */
-static int ensure_reassembly_capacity(mqtt_t *mqtt, size_t needed_capacity)
+static uint8_t* alloc_rbuf(uint8_t *old_buf, size_t old_cap, size_t need, size_t *new_cap_out)
 {
-    if (mqtt->reassembly_capacity >= needed_capacity) {
-        return 0;
+    if (old_cap >= need) {
+        *new_cap_out = old_cap;
+        return old_buf;
     }
-    
-    // Calculate new capacity (at least double current, but at least needed)
-    size_t new_capacity = mqtt->reassembly_capacity * 2;
-    if (new_capacity < needed_capacity) {
-        new_capacity = needed_capacity;
-    }
-    
-    // Minimum initial capacity
-    if (new_capacity < 1024) {
-        new_capacity = 1024;
-    }
-    
-    uint8_t *new_buf = mqtt_realloc(mqtt->reassembly_buf, new_capacity);
-    if (!new_buf) {
-        return -1;
-    }
-    
-    mqtt->reassembly_buf = new_buf;
-    mqtt->reassembly_capacity = new_capacity;
-    return 0;
+
+    size_t new_cap = old_cap * MQTT_BUFFER_GROWTH_FACTOR;
+    if (new_cap < need) new_cap = need;
+    if (new_cap < MQTT_REASSEMBLY_BUF_SIZE) new_cap = MQTT_REASSEMBLY_BUF_SIZE;
+
+    uint8_t *new_buf = mqtt_realloc(old_buf, new_cap);
+    if (!new_buf) return NULL;
+
+    *new_cap_out = new_cap;
+    return new_buf;
 }
 
-/**
- * @brief Clear reassembly buffer
- * @param mqtt MQTT instance
- */
-static void clear_reassembly_buffer(mqtt_t *mqtt)
+static uint8_t* detach_rbuf(mqtt_t *mqtt)
 {
-    if (mqtt && mqtt->reassembly_buf) {
-        mqtt_free(mqtt->reassembly_buf);
-        mqtt->reassembly_buf = NULL;
-        mqtt->reassembly_len = 0;
-        mqtt->reassembly_capacity = 0;
-    }
+    uint8_t *buf = mqtt->rbuf;
+    mqtt->rbuf = NULL;
+    mqtt->rlen = 0;
+    mqtt->rcap = 0;
+    return buf;
 }
+
+/* Public API */
 
 mqtt_t *mqtt_create(const mqtt_config_t *config, const mqtt_handler_t *handler, void *user_data)
 {
-    if (!config || !handler || !handler->send) {
-        return NULL;
-    }
-
-    // Validate required configuration
-    if (!config->client_id || strlen(config->client_id) == 0) {
-        return NULL;
-    }
+    if (!config || !handler || !handler->send) return NULL;
+    if (!config->client_id || strlen(config->client_id) == 0) return NULL;
 
     mqtt_t *mqtt = mqtt_calloc(1, sizeof(mqtt_t));
-    if (!mqtt) {
-        return NULL;
-    }
+    if (!mqtt) return NULL;
 
-    // Copy configuration
     memcpy(&mqtt->config, config, sizeof(mqtt_config_t));
-    
-    // Copy handlers
     memcpy(&mqtt->handler, handler, sizeof(mqtt_handler_t));
-    
+
     mqtt->user_data = user_data;
     mqtt->state = MQTT_STATE_DISCONNECTED;
-    mqtt->next_packet_id = 1;
-    mqtt->missed_pingresp_count = 0;
-    
-    // Initialize packet reassembly buffers
-    mqtt->reassembly_buf = NULL;
-    mqtt->reassembly_len = 0;
-    mqtt->reassembly_capacity = 0;
-    
-    // Initialize spinlock
+    mqtt->next_packet_id = MQTT_PACKET_ID_START;
+    mqtt->missed_pings = 0;
+    mqtt->rbuf = NULL;
+    mqtt->rlen = 0;
+    mqtt->rcap = 0;
     mqtt->lock = 0;
-    
+
     return mqtt;
 }
 
 void mqtt_destroy(mqtt_t *mqtt)
 {
-    if (!mqtt) {
-        return;
-    }
-    
-    // Disconnect if still connected
+    if (!mqtt) return;
+
     if (mqtt->state == MQTT_STATE_CONNECTED || mqtt->state == MQTT_STATE_CONNECTING) {
         mqtt_disconnect(mqtt);
     }
-    
-    // Free reassembly buffer
-    if (mqtt->reassembly_buf) {
-        mqtt_free(mqtt->reassembly_buf);
-    }
-    
+
+    if (mqtt->rbuf) mqtt_free(mqtt->rbuf);
     mqtt_free(mqtt);
 }
 
 int mqtt_connect(mqtt_t *mqtt)
 {
-    if (!mqtt) {
-        return -1;
+    if (!mqtt || mqtt->state != MQTT_STATE_DISCONNECTED) return -1;
+
+    uint8_t *buf = mqtt_malloc(MQTT_MIN_PACKET_BUFFER_SIZE);
+    if (!buf) return -1;
+
+    size_t len = mqtt_create_connect_packet(&mqtt->config, buf, MQTT_MIN_PACKET_BUFFER_SIZE);
+
+    int ret = -1;
+    if (len > 0 && mqtt->handler.send(buf, len, mqtt->user_data) == (int)len) {
+        LOCK(mqtt);
+        mqtt->state = MQTT_STATE_CONNECTING;
+        mqtt->keepalive_timer = 0;
+        mqtt->last_activity = 0;
+        UNLOCK(mqtt);
+        ret = 0;
     }
 
-    if (mqtt->state != MQTT_STATE_DISCONNECTED) {
-        return -1;
-    }
-
-    // Create and send CONNECT packet
-    uint8_t packet_buf[1024];
-    size_t packet_len = create_connect_packet(&mqtt->config, packet_buf, sizeof(packet_buf));
-    
-    if (packet_len == 0) {
-        return -1;
-    }
-    
-    if (mqtt->handler.send(packet_buf, packet_len, mqtt->user_data) != (int)packet_len) {
-        return -1;
-    }
-    
-    LOCK(mqtt);
-    mqtt->state = MQTT_STATE_CONNECTING;
-    mqtt->keep_alive_timer = 0;
-    mqtt->last_activity = 0; // TODO: Use actual timestamp
-    UNLOCK(mqtt);
-
-    return 0;
+    mqtt_free(buf);
+    return ret;
 }
 
 int mqtt_disconnect(mqtt_t *mqtt)
 {
-    if (!mqtt) {
-        return -1;
+    if (!mqtt || mqtt->state == MQTT_STATE_DISCONNECTED) return -1;
+
+    uint8_t buf[MQTT_DISCONNECT_PACKET_SIZE];
+    size_t len = mqtt_create_disconnect_packet(buf, sizeof(buf));
+
+    if (len > 0 && mqtt->handler.send) {
+        mqtt->handler.send(buf, len, mqtt->user_data);
     }
 
-    if (mqtt->state == MQTT_STATE_DISCONNECTED) {
-        return -1;
-    }
-
-    // Send DISCONNECT packet
-    uint8_t packet_buf[2];
-    size_t packet_len = create_disconnect_packet(packet_buf, sizeof(packet_buf));
-    
-    if (packet_len > 0 && mqtt->handler.send) {
-        mqtt->handler.send(packet_buf, packet_len, mqtt->user_data);
-    }
-    
     LOCK(mqtt);
     mqtt->state = MQTT_STATE_DISCONNECTED;
-    
-    // Clear reassembly buffer on disconnect
-    clear_reassembly_buffer(mqtt);
-    
+    uint8_t *old_buf = detach_rbuf(mqtt);
     UNLOCK(mqtt);
-    
-    // Call connection callback outside of lock
+
+    if (old_buf) mqtt_free(old_buf);
+
     if (mqtt->handler.on_connection) {
         mqtt->handler.on_connection(false, MQTT_CONN_ACCEPTED, mqtt->user_data);
     }
-    
+
     return 0;
 }
 
 int mqtt_publish(mqtt_t *mqtt, const mqtt_message_t *message)
 {
-    if (!mqtt || !message || !message->topic) {
-        return -1;
-    }
-    
-    if (mqtt->state != MQTT_STATE_CONNECTED) {
-        return -1;
-    }
+    if (!mqtt || !message || !message->topic) return -1;
+    if (mqtt->state != MQTT_STATE_CONNECTED) return -1;
 
-    // Only QoS 0 is supported
-    if (message->qos != MQTT_QOS_0) {
-        return -1;
-    }
-
-    // Calculate required buffer size for PUBLISH packet (QoS 0 only)
-    // Fixed header: 1 byte + variable length bytes (max 4) + topic + payload
     size_t topic_len = strlen(message->topic);
-    size_t fixed_header_size = 1 + 4; // packet type + max variable length bytes
-    size_t topic_field_size = 2 + topic_len; // length + topic
-    size_t payload_size = message->payload_len;
-    
-    size_t required_size = fixed_header_size + topic_field_size + payload_size;
-    
-    // Allocate buffer dynamically based on actual message size
-    uint8_t *packet_buf = mqtt_malloc(required_size);
-    if (!packet_buf) {
-        return -1;
-    }
-    
-    size_t packet_len = create_publish_packet(message, packet_buf, required_size);
-    
-    if (packet_len == 0) {
-        mqtt_free(packet_buf);
-        return -1;
-    }
-    
-    if (mqtt->handler.send(packet_buf, packet_len, mqtt->user_data) != (int)packet_len) {
-        mqtt_free(packet_buf);
+    size_t req_size = MQTT_PUBLISH_VARLEN_MAX + MQTT_PUBLISH_TOPIC_LEN_SIZE + topic_len + message->payload_len;
+
+    uint8_t *buf = mqtt_malloc(req_size);
+    if (!buf) return -1;
+
+    size_t len = mqtt_create_publish_packet(message, buf, req_size);
+    if (len == 0) {
+        mqtt_free(buf);
         return -1;
     }
 
-    // Free the buffer (QoS 0 only - no retransmission needed)
-    mqtt_free(packet_buf);
+    int ret = mqtt->handler.send(buf, len, mqtt->user_data);
+    mqtt_free(buf);
 
-    return 0;
+    return (ret == (int)len) ? 0 : -1;
 }
 
 int mqtt_subscribe(mqtt_t *mqtt, const char **topics, const mqtt_qos_t *qos, size_t count)
 {
-    if (!mqtt || !topics || !qos || count == 0) {
-        return -1;
-    }
-    
-    if (mqtt->state != MQTT_STATE_CONNECTED) {
-        return -1;
-    }
+    if (!mqtt || !topics || !qos || count == 0) return -1;
+    if (mqtt->state != MQTT_STATE_CONNECTED) return -1;
 
-    // Only QoS 0 is supported - validate all requested QoS levels
-    for (size_t i = 0; i < count; i++) {
-        if (qos[i] != MQTT_QOS_0) {
-            return -1;
-        }
-    }
+    uint8_t *buf = mqtt_malloc(MQTT_MIN_PACKET_BUFFER_SIZE);
+    if (!buf) return -1;
 
-    // Create and send SUBSCRIBE packet (packet ID required even for QoS 0 subscriptions)
-    uint8_t packet_buf[1024];
-    uint16_t packet_id = mqtt_get_packet_id(mqtt);
-    size_t packet_len = create_subscribe_packet(topics, qos, count, packet_id, packet_buf, sizeof(packet_buf));
+    uint16_t pkt_id = mqtt_get_packet_id(mqtt);
+    size_t len = mqtt_create_subscribe_packet(topics, qos, count, pkt_id, buf, MQTT_MIN_PACKET_BUFFER_SIZE);
 
-    if (packet_len == 0) {
-        return -1;
+    int ret = -1;
+    if (len > 0 && mqtt->handler.send(buf, len, mqtt->user_data) == (int)len) {
+        ret = 0;
     }
 
-    if (mqtt->handler.send(packet_buf, packet_len, mqtt->user_data) != (int)packet_len) {
-        return -1;
-    }
-
-    return 0;
+    mqtt_free(buf);
+    return ret;
 }
 
 int mqtt_unsubscribe(mqtt_t *mqtt, const char **topics, size_t count)
 {
-    if (!mqtt || !topics || count == 0) {
-        return -1;
+    if (!mqtt || !topics || count == 0) return -1;
+    if (mqtt->state != MQTT_STATE_CONNECTED) return -1;
+
+    uint8_t *buf = mqtt_malloc(MQTT_MIN_PACKET_BUFFER_SIZE);
+    if (!buf) return -1;
+
+    size_t len = mqtt_create_unsubscribe_packet(topics, count, 0, buf, MQTT_MIN_PACKET_BUFFER_SIZE);
+
+    int ret = -1;
+    if (len > 0 && mqtt->handler.send(buf, len, mqtt->user_data) == (int)len) {
+        ret = 0;
     }
 
-    if (mqtt->state != MQTT_STATE_CONNECTED) {
-        return -1;
-    }
-
-    // Create and send UNSUBSCRIBE packet (QoS 0 only)
-    uint8_t packet_buf[1024];
-    size_t packet_len = create_unsubscribe_packet(topics, count, 0, packet_buf, sizeof(packet_buf));
-    
-    if (packet_len == 0) {
-        return -1;
-    }
-    
-    if (mqtt->handler.send(packet_buf, packet_len, mqtt->user_data) != (int)packet_len) {
-        return -1;
-    }
-    
-    return 0;
+    mqtt_free(buf);
+    return ret;
 }
 
-/**
- * @brief Parse and process incoming MQTT packet
- * @param mqtt MQTT instance
- * @param data Packet data
- * @param len Packet length
- * @return 0 on success, -1 on error
- */
 static int process_packet(mqtt_t *mqtt, const uint8_t *data, size_t len)
 {
-    if (len < 2) {
-        return -1; // Minimum packet length is 2 bytes
-    }
-    
-    uint8_t packet_type = (data[0] >> 4) & 0x0F;
-    
-    switch (packet_type) {
+    if (len < MQTT_MIN_HEADER_SIZE) return -1;
+
+    uint8_t pkt_type = (data[0] >> MQTT_FIXED_HEADER_TYPE_SHIFT) & MQTT_FIXED_HEADER_FLAGS_BITS;
+
+    switch (pkt_type) {
         case MQTT_PKT_CONNACK:
-            if (len >= 4) {
-                uint8_t return_code = data[3];
-                
-                if (return_code == MQTT_CONN_ACCEPTED) {
-                    // Update state under lock
-                    LOCK(mqtt);
-                    mqtt->state = MQTT_STATE_CONNECTED;
-                    mqtt->missed_pingresp_count = 0; // Reset missed counter on successful connection
-                    UNLOCK(mqtt);
-                    
-                    // Call callback without lock
-                    if (mqtt->handler.on_connection) {
-                        mqtt->handler.on_connection(true, MQTT_CONN_ACCEPTED, mqtt->user_data);
-                    }
-                } else {
-                    // Update state under lock
-                    LOCK(mqtt);
-                    mqtt->state = MQTT_STATE_DISCONNECTED;
-                    UNLOCK(mqtt);
-                    
-                    // Call callback without lock
-                    if (mqtt->handler.on_connection) {
-                        mqtt->handler.on_connection(false, (mqtt_conn_return_t)return_code, mqtt->user_data);
-                    }
+            if (len >= MQTT_CONNACK_MIN_SIZE) {
+                uint8_t rc = data[MQTT_CONNACK_RC_OFFSET];
+
+                LOCK(mqtt);
+                mqtt->state = (rc == MQTT_CONN_ACCEPTED) ? MQTT_STATE_CONNECTED : MQTT_STATE_DISCONNECTED;
+                if (rc == MQTT_CONN_ACCEPTED) mqtt->missed_pings = 0;
+                UNLOCK(mqtt);
+
+                if (mqtt->handler.on_connection) {
+                    mqtt->handler.on_connection(rc == MQTT_CONN_ACCEPTED, (mqtt_conn_return_t)rc, mqtt->user_data);
                 }
             }
             break;
             
         case MQTT_PKT_PUBLISH:
-            // Parse PUBLISH packet
-            if (len >= 4) {
-                size_t pos = 1; // Skip fixed header
-                
-                // Read variable length
-                uint32_t remaining_length;
-                size_t var_len_bytes = read_variable_length(data + pos, &remaining_length);
-                if (var_len_bytes == 0) {
-                    return -1;
-                }
-                pos += var_len_bytes;
-                
-                // Read topic name
-                char topic[256];
-                size_t topic_bytes = read_string(data + pos, topic, sizeof(topic));
-                if (topic_bytes == 0) {
-                    return -1;
-                }
-                pos += topic_bytes;
-                
-                // Read packet ID for QoS > 0
-                uint8_t qos = (data[0] >> 1) & 0x03;
-                uint16_t packet_id = 0;
-                if (qos > MQTT_QOS_0) {
-                    if (pos + 2 > len) {
-                        return -1;
-                    }
-                    packet_id = (data[pos] << 8) | data[pos + 1];
-                    pos += 2;
-                }
-                
-                // Read payload
-                size_t payload_len = 0;
-                if (pos < len) {
-                    payload_len = len - pos;
-                }
-                
-                bool retain = (data[0] & 0x01) != 0;
-                
-                // Call message callback without lock
+            if (len >= MQTT_PUBLISH_MIN_SIZE) {
+                size_t pos = MQTT_VARLEN_INITIAL_POS;
+
+                uint32_t rem_len;
+                size_t vlen = mqtt_read_variable_length(data + pos, &rem_len);
+                if (vlen == 0) return -1;
+                pos += vlen;
+
+                char topic[MQTT_TOPIC_BUFFER_SIZE];
+                size_t tlen = mqtt_read_string(data + pos, topic, sizeof(topic));
+                if (tlen == 0) return -1;
+                pos += tlen;
+
+                size_t plen = (pos < len) ? (len - pos) : 0;
+                bool retain = (data[0] & MQTT_PUBLISH_FLAG_RETAIN) != 0;
+
                 if (mqtt->handler.on_message) {
-                    mqtt_message_t message = {
+                    mqtt_message_t msg = {
                         .topic = topic,
                         .payload = (uint8_t*)(data + pos),
-                        .payload_len = payload_len,
-                        .qos = (mqtt_qos_t)qos,
+                        .payload_len = plen,
+                        .qos = MQTT_QOS_0,
                         .retain = retain
                     };
-                    mqtt->handler.on_message(&message, mqtt->user_data);
-                }
-                
-                // Send PUBACK for QoS 1
-                if (qos == MQTT_QOS_1 && mqtt->handler.send) {
-                    uint8_t puback_buf[4] = {
-                        (MQTT_PKT_PUBACK << 4),
-                        0x02, // Remaining length
-                        (packet_id >> 8) & 0xFF,
-                        packet_id & 0xFF
-                    };
-                    mqtt->handler.send(puback_buf, sizeof(puback_buf), mqtt->user_data);
+                    mqtt->handler.on_message(&msg, mqtt->user_data);
                 }
             }
             break;
-            
-        case MQTT_PKT_PUBACK:
-            if (len >= 4) {
-                uint16_t packet_id = (data[2] << 8) | data[3];
-                if (mqtt->handler.publish_ack) {
-                    mqtt->handler.publish_ack(packet_id, mqtt->user_data);
-                }
-            }
-            break;
-            
+
         case MQTT_PKT_SUBACK:
-            if (len >= 5) {
-                uint16_t packet_id = (data[2] << 8) | data[3];
-                size_t return_code_count = len - 4;
-                
-                if (mqtt->handler.subscribe_ack && return_code_count <= 16) {
-                    mqtt_qos_t return_codes[16];
-                    for (size_t i = 0; i < return_code_count; i++) {
-                        return_codes[i] = (mqtt_qos_t)data[4 + i];
+            if (len >= MQTT_SUBACK_MIN_SIZE && mqtt->handler.subscribe_ack) {
+                uint16_t pkt_id = (data[MQTT_PACKET_ID_OFFSET] << MQTT_BYTE_SHIFT) | data[MQTT_PACKET_ID_OFFSET + 1];
+                size_t cnt = len - MQTT_SUBACK_PAYLOAD_OFFSET;
+
+                if (cnt <= MQTT_MAX_SUBSCRIBE_TOPICS) {
+                    mqtt_qos_t codes[MQTT_MAX_SUBSCRIBE_TOPICS];
+                    for (size_t i = 0; i < cnt; i++) {
+                        codes[i] = (mqtt_qos_t)data[MQTT_SUBACK_PAYLOAD_OFFSET + i];
                     }
-                    mqtt->handler.subscribe_ack(packet_id, return_codes, return_code_count, mqtt->user_data);
+                    mqtt->handler.subscribe_ack(pkt_id, codes, cnt, mqtt->user_data);
                 }
             }
             break;
-            
+
         case MQTT_PKT_UNSUBACK:
-            if (len >= 4) {
-                uint16_t packet_id = (data[2] << 8) | data[3];
-                if (mqtt->handler.unsubscribe_ack) {
-                    mqtt->handler.unsubscribe_ack(packet_id, mqtt->user_data);
-                }
+            if (len >= MQTT_UNSUBACK_MIN_SIZE && mqtt->handler.unsubscribe_ack) {
+                uint16_t pkt_id = (data[MQTT_PACKET_ID_OFFSET] << MQTT_BYTE_SHIFT) | data[MQTT_PACKET_ID_OFFSET + 1];
+                mqtt->handler.unsubscribe_ack(pkt_id, mqtt->user_data);
             }
             break;
-            
+
         case MQTT_PKT_PINGRESP:
             LOCK(mqtt);
             mqtt->waiting_pingresp = false;
-            mqtt->missed_pingresp_count = 0; // Reset missed counter on successful PINGRESP
+            mqtt->missed_pings = 0;
             UNLOCK(mqtt);
             break;
-            
+
         case MQTT_PKT_DISCONNECT:
-            // Update state under lock
             LOCK(mqtt);
             mqtt->state = MQTT_STATE_DISCONNECTED;
             UNLOCK(mqtt);
-            
-            // Call callback without lock
+
             if (mqtt->handler.on_connection) {
                 mqtt->handler.on_connection(false, MQTT_CONN_ACCEPTED, mqtt->user_data);
             }
             break;
-            
+
         default:
-            // Unknown packet type - ignore
             break;
     }
-    
+
+
     return 0;
 }
 
 int mqtt_input(mqtt_t *mqtt, const uint8_t *data, size_t len)
 {
-    if (!mqtt || !data || len == 0) {
-        return -1;
+    if (!mqtt || !data || len == 0) return -1;
+
+    size_t consumed = len;
+    const uint8_t *process_data = data;
+    size_t process_len = len;
+    uint8_t *working_buf = NULL;
+
+    LOCK(mqtt);
+    size_t rlen = mqtt->rlen;
+    uint8_t *rbuf = mqtt->rbuf;
+    size_t rcap = mqtt->rcap;
+    UNLOCK(mqtt);
+
+    if (rlen > 0) {
+        size_t need = rlen + len;
+        size_t new_cap;
+        uint8_t *new_buf = alloc_rbuf(rbuf, rcap, need, &new_cap);
+        if (!new_buf) return -1;
+
+        memcpy(new_buf + rlen, data, len);
+        working_buf = new_buf;
+        process_data = new_buf;
+        process_len = rlen + len;
+
+        LOCK(mqtt);
+        mqtt->rbuf = new_buf;
+        mqtt->rcap = new_cap;
+        mqtt->rlen = 0;
+        UNLOCK(mqtt);
     }
 
-    // Buffer management under lock
-    LOCK(mqtt);
-    
-    // Track how much new data we're processing
-    size_t new_data_len = len;
-    
-    // Combine with existing reassembly data if any
-    if (mqtt->reassembly_len > 0) {
-        // Combine with new data
-        size_t needed_capacity = mqtt->reassembly_len + len;
-        if (ensure_reassembly_capacity(mqtt, needed_capacity) != 0) {
-            UNLOCK(mqtt);
-            return -1;
+    const uint8_t *cur = process_data;
+    size_t rem = process_len;
+
+    while (rem > 0) {
+        size_t exp_len = get_packet_len(cur, rem);
+        if (exp_len == 0 || rem < exp_len) break;
+
+        if (exp_len <= MQTT_MAX_PACKET_SIZE) {
+            process_packet(mqtt, cur, exp_len);
         }
-        
-        // Append new data to reassembly buffer
-        memcpy(mqtt->reassembly_buf + mqtt->reassembly_len, data, len);
-        
-        // Reset tracking variables to process reassembly buffer
-        data = mqtt->reassembly_buf;
-        len = mqtt->reassembly_len + len;
-        mqtt->reassembly_len = 0; // Will be reset if we have incomplete packets
+
+        cur += exp_len;
+        rem -= exp_len;
     }
-    
-    // Process complete packets from the data
-    const uint8_t *current_data = data;
-    size_t remaining_len = len;
-    
-    while (remaining_len > 0) {
-        // Check if we have enough data to determine packet length
-        size_t expected_len = get_expected_packet_length(current_data, remaining_len);
-        
-        if (expected_len == 0) {
-            // Not enough data to determine packet length - save for reassembly
-            break;
+
+    if (rem > 0) {
+        size_t new_cap;
+        LOCK(mqtt);
+        rbuf = mqtt->rbuf;
+        rcap = mqtt->rcap;
+        UNLOCK(mqtt);
+
+        uint8_t *new_buf = alloc_rbuf(rbuf, rcap, rem, &new_cap);
+        if (!new_buf) return -1;
+
+        if (new_buf != cur) {
+            memmove(new_buf, cur, rem);
         }
-        
-        if (remaining_len < expected_len) {
-            // Incomplete packet - save for reassembly
-            break;
-        }
-        
-        // We have a complete packet - process it immediately
-        if (expected_len <= MQTT_MAX_PACKET_SIZE) {
-            // Copy packet data to process outside of lock
-            uint8_t packet_buffer[MQTT_MAX_PACKET_SIZE];
-            memcpy(packet_buffer, current_data, expected_len);
-            
-            UNLOCK(mqtt);
-            
-            // Process packet and call callbacks without lock
-            process_packet(mqtt, packet_buffer, expected_len);
-            
-            LOCK(mqtt);
-        }
-        
-        current_data += expected_len;
-        remaining_len -= expected_len;
-    }
-    
-    // Handle incomplete data that needs reassembly
-    if (remaining_len > 0) {
-        // Save incomplete data to reassembly buffer
-        if (ensure_reassembly_capacity(mqtt, remaining_len) != 0) {
-            UNLOCK(mqtt);
-            return -1;
-        }
-        memcpy(mqtt->reassembly_buf, current_data, remaining_len);
-        mqtt->reassembly_len = remaining_len;
+
+        LOCK(mqtt);
+        mqtt->rbuf = new_buf;
+        mqtt->rcap = new_cap;
+        mqtt->rlen = rem;
+        mqtt->last_activity = 0;
+        UNLOCK(mqtt);
     } else {
-        // Clear reassembly buffer if we processed all data
-        mqtt->reassembly_len = 0;
+        LOCK(mqtt);
+        mqtt->rlen = 0;
+        mqtt->last_activity = 0;
+        UNLOCK(mqtt);
     }
-    
-    // Update last activity timestamp
-    mqtt->last_activity = 0; // TODO: Use actual timestamp
-    
-    UNLOCK(mqtt);
-    
-    // Always return that we consumed all the new data we were given
-    return (int)new_data_len;
+
+    return (int)consumed;
 }
 
 int mqtt_timer(mqtt_t *mqtt, uint32_t elapsed_ms)
 {
-    if (!mqtt) {
-        return -1;
-    }
+    if (!mqtt) return -1;
 
     LOCK(mqtt);
-    
-    // Update keep-alive timer
+
     if (mqtt->state == MQTT_STATE_CONNECTED && mqtt->config.keep_alive > 0) {
-        mqtt->keep_alive_timer += elapsed_ms;
-        
-        // Check if we need to send PINGREQ
-        uint32_t keep_alive_ms = mqtt->config.keep_alive * 1000;
-        if (mqtt->keep_alive_timer >= keep_alive_ms) {
+        mqtt->keepalive_timer += elapsed_ms;
+
+        uint32_t ka_ms = mqtt->config.keep_alive * MQTT_KEEPALIVE_MS_MULTIPLIER;
+        if (mqtt->keepalive_timer >= ka_ms) {
             if (!mqtt->waiting_pingresp) {
-                // Send PINGREQ - prepare data outside of lock
-                uint8_t pingreq_buf[2];
-                size_t pingreq_len = create_pingreq_packet(pingreq_buf, sizeof(pingreq_buf));
-                
-                // Update state under lock
+                uint8_t ping[MQTT_PINGREQ_PACKET_SIZE];
+                size_t plen = mqtt_create_pingreq_packet(ping, sizeof(ping));
+
                 mqtt->waiting_pingresp = true;
-                mqtt->keep_alive_timer = 0;
-                
+                mqtt->keepalive_timer = 0;
+
                 UNLOCK(mqtt);
-                
-                // Send PINGREQ outside of lock
-                if (pingreq_len > 0 && mqtt->handler.send) {
-                    mqtt->handler.send(pingreq_buf, pingreq_len, mqtt->user_data);
+
+                if (plen > 0 && mqtt->handler.send) {
+                    mqtt->handler.send(ping, plen, mqtt->user_data);
                 }
-                
+
                 return 0;
             } else {
-                // PINGREQ timeout - increment missed counter
-                mqtt->missed_pingresp_count++;
-                
-                // Disconnect after 3 consecutive missed PINGRESP responses
-                if (mqtt->missed_pingresp_count >= 3) {
+                mqtt->missed_pings++;
+
+                if (mqtt->missed_pings >= MQTT_PINGRESP_MAX_MISSED) {
                     mqtt->state = MQTT_STATE_DISCONNECTED;
                     UNLOCK(mqtt);
-                    
-                    // Call connection callback outside of lock
+
                     if (mqtt->handler.on_connection) {
                         mqtt->handler.on_connection(false, MQTT_CONN_REFUSED_SERVER, mqtt->user_data);
                     }
@@ -683,50 +465,37 @@ int mqtt_timer(mqtt_t *mqtt, uint32_t elapsed_ms)
 
 mqtt_state_t mqtt_get_state(const mqtt_t *mqtt)
 {
-    if (!mqtt) {
-        return MQTT_STATE_DISCONNECTED;
-    }
-    
-    // Cast away const to access lock for thread safety
-    mqtt_t *non_const_mqtt = (mqtt_t *)mqtt;
-    LOCK(non_const_mqtt);
-    mqtt_state_t state = mqtt->state;
-    UNLOCK(non_const_mqtt);
-    
-    return state;
+    if (!mqtt) return MQTT_STATE_DISCONNECTED;
+
+    mqtt_t *m = (mqtt_t *)mqtt;
+    LOCK(m);
+    mqtt_state_t st = mqtt->state;
+    UNLOCK(m);
+
+    return st;
 }
 
 bool mqtt_is_connected(const mqtt_t *mqtt)
 {
-    if (!mqtt) {
-        return false;
-    }
-    
-    // Cast away const to access lock for thread safety
-    mqtt_t *non_const_mqtt = (mqtt_t *)mqtt;
-    LOCK(non_const_mqtt);
-    bool connected = (mqtt->state == MQTT_STATE_CONNECTED);
-    UNLOCK(non_const_mqtt);
-    
-    return connected;
+    if (!mqtt) return false;
+
+    mqtt_t *m = (mqtt_t *)mqtt;
+    LOCK(m);
+    bool conn = (mqtt->state == MQTT_STATE_CONNECTED);
+    UNLOCK(m);
+
+    return conn;
 }
 
 uint16_t mqtt_get_packet_id(mqtt_t *mqtt)
 {
-    if (!mqtt) {
-        return 0;
-    }
+    if (!mqtt) return 0;
 
     LOCK(mqtt);
-    
-    uint16_t packet_id = mqtt->next_packet_id;
-    mqtt->next_packet_id++;
-    
-    // Packet ID 0 is reserved, wrap around
-    if (mqtt->next_packet_id == 0) {
-        mqtt->next_packet_id = 1;
-    }
-    
+
+    uint16_t id = mqtt->next_packet_id++;
+    if (mqtt->next_packet_id == 0) mqtt->next_packet_id = MQTT_PACKET_ID_START;
+
     UNLOCK(mqtt);
-    return packet_id;
+    return id;
 }

@@ -1,15 +1,18 @@
 /**
  * @file mqtt_helper.c
- * @brief MQTT helper utilities - memory management and TCP transport layer
- * 
- * Provides memory allocation functions with optional debugging and statistics,
- * and TCP transport layer implementation for MQTT communication.
+ * @brief MQTT helper utilities - memory management
+ *
+ * Provides memory allocation functions with optional debugging and statistics.
  */
 
 #include "mqtt.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
+/* ============================================================================
+ * Memory Debugging Support
+ * ========================================================================= */
 
 #ifdef MQTT_MEM_DEBUG
 #include <assert.h>
@@ -39,6 +42,10 @@ typedef struct {
 #define MEM_MAGIC 0x4D515454  // "MQTT" in hex
 
 #endif
+
+/* ============================================================================
+ * Internal Memory Management Functions
+ * ========================================================================= */
 
 /**
  * @brief Allocate memory with optional debugging
@@ -226,7 +233,9 @@ static char *mqtt_strdup_internal(const char *str, const char *file, int line)
     return dup;
 }
 
-// Public API functions
+/* ============================================================================
+ * Public Memory Management API
+ * ========================================================================= */
 
 void *mqtt_malloc(size_t size)
 {

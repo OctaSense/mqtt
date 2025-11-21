@@ -4,19 +4,28 @@
  */
 
 #include "mqtt.h"
+#include "mqtt_intl.h"
 #include <string.h>
 #include <assert.h>
+
+/* ============================================================================
+ * Internal Data Structures
+ * ========================================================================= */
 
 /**
  * @brief MQTT fixed header structure
  */
 typedef struct {
-    uint8_t type : 4;         /**< Packet type */
-    uint8_t dup : 1;          /**< Duplicate flag */
-    uint8_t qos : 2;          /**< QoS level */
-    uint8_t retain : 1;       /**< Retain flag */
-    uint32_t remaining_length; /**< Remaining length */
+    uint8_t type : 4;              /**< Packet type */
+    uint8_t dup : 1;               /**< Duplicate flag */
+    uint8_t qos : 2;               /**< QoS level */
+    uint8_t retain : 1;            /**< Retain flag */
+    uint32_t remaining_length;     /**< Remaining length */
 } mqtt_fixed_header_t;
+
+/* ============================================================================
+ * Internal Helper Functions - Variable Length Encoding
+ * ========================================================================= */
 
 /**
  * @brief Write MQTT variable length integer
@@ -31,9 +40,9 @@ static size_t write_variable_length(uint8_t *buf, uint32_t value)
     do {
         uint8_t encoded_byte = value % 128;
         value /= 128;
-        
+
         if (value > 0) {
-            encoded_byte |= 0x80;
+            encoded_byte |= MQTT_VARLEN_CONTINUE;
         }
         
         buf[len++] = encoded_byte;
@@ -48,7 +57,7 @@ static size_t write_variable_length(uint8_t *buf, uint32_t value)
  * @param value Output value
  * @return Number of bytes read, or 0 on error
  */
-size_t read_variable_length(const uint8_t *buf, uint32_t *value)
+size_t mqtt_read_variable_length(const uint8_t *buf, uint32_t *value)
 {
     uint32_t multiplier = 1;
     size_t len = 0;
@@ -57,18 +66,22 @@ size_t read_variable_length(const uint8_t *buf, uint32_t *value)
     *value = 0;
     
     do {
-        if (len >= 4) {
+        if (len >= MQTT_VARLEN_MAX_BYTES) {
             return 0; // Maximum 4 bytes for variable length
         }
-        
+
         encoded_byte = buf[len++];
-        *value += (encoded_byte & 0x7F) * multiplier;
-        multiplier *= 128;
-        
-    } while ((encoded_byte & 0x80) != 0);
+        *value += (encoded_byte & MQTT_VARLEN_MASK) * multiplier;
+        multiplier *= MQTT_VARLEN_MULTIPLIER_BASE;
+
+    } while ((encoded_byte & MQTT_VARLEN_CONTINUE) != 0);
     
     return len;
 }
+
+/* ============================================================================
+ * Internal Helper Functions - String Encoding
+ * ========================================================================= */
 
 /**
  * @brief Write MQTT string
@@ -101,7 +114,7 @@ static size_t write_string(uint8_t *buf, const char *str)
  * @param max_len Maximum string length
  * @return Number of bytes read, or 0 on error
  */
-size_t read_string(const uint8_t *buf, char *str, size_t max_len)
+size_t mqtt_read_string(const uint8_t *buf, char *str, size_t max_len)
 {
     if (!buf || !str || max_len < 3) {
         return 0;
@@ -121,6 +134,10 @@ size_t read_string(const uint8_t *buf, char *str, size_t max_len)
     return str_len + 2;
 }
 
+/* ============================================================================
+ * Public Packet Creation Functions
+ * ========================================================================= */
+
 /**
  * @brief Create CONNECT packet
  * @param config MQTT configuration
@@ -128,7 +145,7 @@ size_t read_string(const uint8_t *buf, char *str, size_t max_len)
  * @param buf_len Buffer length
  * @return Packet length, or 0 on error
  */
-size_t create_connect_packet(const mqtt_config_t *config, uint8_t *buf, size_t buf_len)
+size_t mqtt_create_connect_packet(const mqtt_config_t *config, uint8_t *buf, size_t buf_len)
 {
     if (!config || !buf || buf_len < 10) {
         return 0;
@@ -153,25 +170,25 @@ size_t create_connect_packet(const mqtt_config_t *config, uint8_t *buf, size_t b
 
     // Protocol name "MQTT"
     buf[pos++] = 0x00;
-    buf[pos++] = 0x04;
+    buf[pos++] = MQTT_PROTOCOL_NAME_LEN;
     buf[pos++] = 'M';
     buf[pos++] = 'Q';
     buf[pos++] = 'T';
     buf[pos++] = 'T';
 
     // Protocol level (4 = MQTT 3.1.1)
-    buf[pos++] = 0x04;
+    buf[pos++] = MQTT_PROTOCOL_LEVEL_3_1_1;
 
     // Connect flags
     uint8_t connect_flags = 0;
     if (config->clean_session) {
-        connect_flags |= 0x02;
+        connect_flags |= MQTT_CONNECT_FLAG_CLEAN_SESSION;
     }
     if (config->username) {
-        connect_flags |= 0x80;
+        connect_flags |= MQTT_CONNECT_FLAG_USERNAME;
     }
     if (config->password) {
-        connect_flags |= 0x40;
+        connect_flags |= MQTT_CONNECT_FLAG_PASSWORD;
     }
     buf[pos++] = connect_flags;
 
@@ -217,7 +234,7 @@ size_t create_connect_packet(const mqtt_config_t *config, uint8_t *buf, size_t b
  * @param buf_len Buffer length
  * @return Packet length, or 0 on error
  */
-size_t create_publish_packet(const mqtt_message_t *message, uint8_t *buf, size_t buf_len)
+size_t mqtt_create_publish_packet(const mqtt_message_t *message, uint8_t *buf, size_t buf_len)
 {
     if (!message || !buf || buf_len < 10) {
         return 0;
@@ -231,9 +248,9 @@ size_t create_publish_packet(const mqtt_message_t *message, uint8_t *buf, size_t
     size_t pos = 0;
 
     // Fixed header (QoS 0 only)
-    uint8_t fixed_header = (MQTT_PKT_PUBLISH << 4);
+    uint8_t fixed_header = (MQTT_PKT_PUBLISH << MQTT_FIXED_HEADER_TYPE_SHIFT);
     if (message->retain) {
-        fixed_header |= 0x01;
+        fixed_header |= MQTT_PUBLISH_FLAG_RETAIN;
     }
     // QoS is always 0, so no need to set QoS bits
     buf[pos++] = fixed_header;
@@ -278,15 +295,15 @@ size_t create_publish_packet(const mqtt_message_t *message, uint8_t *buf, size_t
  * @param buf_len Buffer length
  * @return Packet length, or 0 on error
  */
-size_t create_pingreq_packet(uint8_t *buf, size_t buf_len)
+size_t mqtt_create_pingreq_packet(uint8_t *buf, size_t buf_len)
 {
     if (!buf || buf_len < 2) {
         return 0;
     }
-    
-    buf[0] = (MQTT_PKT_PINGREQ << 4);
+
+    buf[0] = (MQTT_PKT_PINGREQ << MQTT_FIXED_HEADER_TYPE_SHIFT);
     buf[1] = 0x00; // Remaining length = 0
-    
+
     return 2;
 }
 
@@ -296,15 +313,15 @@ size_t create_pingreq_packet(uint8_t *buf, size_t buf_len)
  * @param buf_len Buffer length
  * @return Packet length, or 0 on error
  */
-size_t create_disconnect_packet(uint8_t *buf, size_t buf_len)
+size_t mqtt_create_disconnect_packet(uint8_t *buf, size_t buf_len)
 {
     if (!buf || buf_len < 2) {
         return 0;
     }
-    
-    buf[0] = (MQTT_PKT_DISCONNECT << 4);
+
+    buf[0] = (MQTT_PKT_DISCONNECT << MQTT_FIXED_HEADER_TYPE_SHIFT);
     buf[1] = 0x00; // Remaining length = 0
-    
+
     return 2;
 }
 
@@ -318,8 +335,8 @@ size_t create_disconnect_packet(uint8_t *buf, size_t buf_len)
  * @param buf_len Buffer length
  * @return Packet length, or 0 on error
  */
-size_t create_subscribe_packet(const char **topics, const mqtt_qos_t *qos, size_t count, 
-                              uint16_t packet_id, uint8_t *buf, size_t buf_len)
+size_t mqtt_create_subscribe_packet(const char **topics, const mqtt_qos_t *qos, size_t count,
+                                    uint16_t packet_id, uint8_t *buf, size_t buf_len)
 {
     if (!topics || !qos || count == 0 || !buf || buf_len < 10) {
         return 0;
@@ -331,7 +348,7 @@ size_t create_subscribe_packet(const char **topics, const mqtt_qos_t *qos, size_
     size_t pos = 0;
 
     // Fixed header (SUBSCRIBE must use flags 0x02)
-    buf[pos++] = (MQTT_PKT_SUBSCRIBE << 4) | 0x02; // SUBSCRIBE requires QoS 1 in fixed header
+    buf[pos++] = (MQTT_PKT_SUBSCRIBE << MQTT_FIXED_HEADER_TYPE_SHIFT) | MQTT_SUBSCRIBE_FIXED_FLAGS;
 
     // Variable header starts after remaining length
     size_t var_header_pos = pos + 1; // +1 for remaining length byte
@@ -357,7 +374,7 @@ size_t create_subscribe_packet(const char **topics, const mqtt_qos_t *qos, size_
         if (var_header_pos >= buf_len) {
             return 0;
         }
-        buf[var_header_pos++] = qos[i] & 0x03;
+        buf[var_header_pos++] = qos[i] & MQTT_QOS_BITS_MASK;
     }
 
     // Calculate remaining length
@@ -383,8 +400,8 @@ size_t create_subscribe_packet(const char **topics, const mqtt_qos_t *qos, size_
  * @param buf_len Buffer length
  * @return Packet length, or 0 on error
  */
-size_t create_unsubscribe_packet(const char **topics, size_t count, uint16_t packet_id,
-                                uint8_t *buf, size_t buf_len)
+size_t mqtt_create_unsubscribe_packet(const char **topics, size_t count, uint16_t packet_id,
+                                      uint8_t *buf, size_t buf_len)
 {
     if (!topics || count == 0 || !buf || buf_len < 10) {
         return 0;
@@ -394,9 +411,9 @@ size_t create_unsubscribe_packet(const char **topics, size_t count, uint16_t pac
     // (packet_id parameter kept for API compatibility but ignored)
     
     size_t pos = 0;
-    
+
     // Fixed header (QoS 0 only)
-    buf[pos++] = (MQTT_PKT_UNSUBSCRIBE << 4); // UNSUBSCRIBE with QoS 0
+    buf[pos++] = (MQTT_PKT_UNSUBSCRIBE << MQTT_FIXED_HEADER_TYPE_SHIFT); // UNSUBSCRIBE with QoS 0
     
     // Variable header starts after remaining length
     size_t var_header_pos = pos + 1; // +1 for remaining length byte

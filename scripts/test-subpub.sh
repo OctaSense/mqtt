@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Progressive Size Test for MQTT Client
+# MQTT Progressive Size Test - Subscriber and Publisher
 # Tests message sizes from 1 byte to 2MB, doubling each time
 #
 
@@ -8,7 +8,25 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/../build"
-LOG_DIR="/tmp/mqtt_size_test"
+LOG_DIR="/tmp/mqtt_test"
+
+# Configuration
+BROKER="198.19.249.149"
+PORT="1883"
+TOPIC="topic/sizetest"
+USERNAME="sender"
+PASSWORD="123456"
+INTERVAL=2000  # 2 seconds between publishes
+
+# Cleanup function
+cleanup() {
+    echo ""
+    echo "Cleaning up..."
+    pkill -9 mqtt_client 2>/dev/null || true
+    sleep 1
+}
+
+trap cleanup EXIT
 
 # Clean up any existing processes
 pkill -9 mqtt_client 2>/dev/null || true
@@ -27,10 +45,13 @@ echo "========================================="
 echo ""
 
 # Start subscriber
-echo "[1/3] Starting subscriber..."
-./mqtt_client sub 198.19.249.149 1883 topic/sizetest sender 123456 </dev/null > "$LOG_DIR/subscriber.log" 2>&1 &
+echo "[1/2] Starting subscriber..."
+./mqtt_client sub "$BROKER" "$PORT" "$TOPIC" "$USERNAME" "$PASSWORD" \
+    > "$LOG_DIR/subscriber.log" 2>&1 &
 SUB_PID=$!
 echo "      Subscriber PID: $SUB_PID"
+
+# Wait for subscriber to be ready
 sleep 3
 
 if ! ps -p $SUB_PID > /dev/null 2>&1; then
@@ -42,14 +63,13 @@ fi
 echo "      ✓ Subscriber ready"
 echo ""
 
-# Test progressive sizes
-echo "[2/3] Testing message sizes..."
+# Start publisher
+echo "[2/2] Starting publisher with progressive sizes..."
 echo ""
 
 size=1
 max_size=2097152  # 2MB
 count=0
-failed=0
 
 while [ $size -le $max_size ]; do
     # Display size in human-readable format
@@ -63,41 +83,27 @@ while [ $size -le $max_size ]; do
         size_str="${size_mb}MB"
     fi
 
-    printf "  [%2d] %8s (%10d bytes) ... " $count "$size_str" $size
+    printf "  [%2d] Publishing %8s (%10d bytes) ... " $count "$size_str" $size
 
-    # Generate message and send via stdin to avoid ARG_MAX limit
-    # Note: Don't redirect stdin with </dev/null as it would override the pipe
-    head -c $size < /dev/zero | tr '\0' 'B' | \
-        ./mqtt_client pub 198.19.249.149 1883 topic/sizetest - 100 sender 123456 \
+    # Generate and publish message via stdin
+    head -c $size < /dev/zero | tr '\0' 'X' | \
+        ./mqtt_client pub "$BROKER" "$PORT" "$TOPIC" - "$INTERVAL" "$USERNAME" "$PASSWORD" \
         > "$LOG_DIR/pub_${size}.log" 2>&1 &
     PUB_PID=$!
 
-    # Wait for publish (longer for larger messages)
-    # Increased wait times to ensure publisher has time to connect AND send messages
-    # Publishers need ~3s to connect + time to publish at least once
-    if [ $size -lt 10240 ]; then
-        sleep 2
-    elif [ $size -lt 102400 ]; then
-        sleep 4
-    else
-        sleep 8
-    fi
+    # Wait 10 seconds: 5s for connection + 2s interval + 2s publishing + 1s buffer
+    sleep 10
 
     # Stop publisher
     kill -9 $PUB_PID 2>/dev/null || true
     wait $PUB_PID 2>/dev/null || true
 
-    # Check if published
+    # Check if published successfully
     if grep -q "Published:" "$LOG_DIR/pub_${size}.log"; then
         echo "✓"
     else
         echo "✗"
-        failed=$((failed + 1))
-        if [ $failed -ge 3 ]; then
-            echo ""
-            echo "Too many failures, stopping test"
-            break
-        fi
+        echo "      Failed to publish, check log: $LOG_DIR/pub_${size}.log"
     fi
 
     size=$((size * 2))
@@ -105,30 +111,29 @@ while [ $size -le $max_size ]; do
 done
 
 echo ""
+echo "Publishing complete. Waiting 3 seconds for final messages..."
+sleep 3
 
 # Check results
-echo "[3/3] Verifying results..."
-sleep 2
-
+echo ""
+echo "Checking results..."
 if ps -p $SUB_PID > /dev/null 2>&1; then
-    recv_count=$(grep -c "Received.*bytes:" "$LOG_DIR/subscriber.log" || echo "0")
-    echo "      Messages sent: $count"
-    echo "      Messages received: $recv_count"
-    
-    if [ $recv_count -eq $count ]; then
-        echo "      ✓ All messages received!"
+    recv_count=$(grep -c "Received.*bytes:" "$LOG_DIR/subscriber.log" 2>/dev/null || echo "0")
+    echo "  Messages published: $count"
+    echo "  Messages received: $recv_count"
+    echo ""
+
+    if [ "$recv_count" = "$count" ]; then
+        echo "  ✓ SUCCESS: All messages received!"
     elif [ $recv_count -gt 0 ]; then
-        echo "      ⚠ Partial success ($recv_count/$count)"
+        echo "  ⚠ WARNING: Partial success ($recv_count/$count)"
     else
-        echo "      ✗ No messages received"
+        echo "  ✗ FAILURE: No messages received"
     fi
 else
-    echo "      ✗ Subscriber exited unexpectedly"
+    echo "  ✗ ERROR: Subscriber exited unexpectedly"
+    cat "$LOG_DIR/subscriber.log"
 fi
-
-# Cleanup
-kill -9 $SUB_PID 2>/dev/null || true
-sleep 1
 
 echo ""
 echo "========================================="
@@ -136,7 +141,6 @@ echo "  Test Complete"
 echo "========================================="
 echo ""
 echo "Logs saved in: $LOG_DIR"
-echo ""
-echo "View subscriber log: cat $LOG_DIR/subscriber.log"
-echo "View specific size: cat $LOG_DIR/pub_<size>.log"
+echo "  - Subscriber: $LOG_DIR/subscriber.log"
+echo "  - Publishers: $LOG_DIR/pub_*.log"
 echo ""
